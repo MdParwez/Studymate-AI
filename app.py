@@ -226,19 +226,25 @@ if "embeddings" not in st.session_state:
 
 if "chroma_db" not in st.session_state:
     try:
-        st.session_state.chroma_db = ChromaClass(embedding_function=st.session_state.embeddings, persist_directory=None)
+        # Try normal Chroma
+        st.session_state.chroma_db = ChromaClass(
+            embedding_function=st.session_state.embeddings,
+            persist_directory=None
+        )
         st.session_state._chroma_direct = False
-    except Exception:
-        # fallback to chromadb direct client
+    except RuntimeError as e:
+        # If SQLite is too old or unsupported, fallback to DuckDB+Parquet mode
         import chromadb
         from chromadb.config import Settings
-        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet"))
+        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet",
+                                          persist_directory=".chromadb"))
         try:
             collection = client.get_collection("studymate")
         except Exception:
             collection = client.create_collection("studymate")
         st.session_state.chroma_db = collection
         st.session_state._chroma_direct = True
+
 
 if "indexed_files" not in st.session_state:
     st.session_state.indexed_files = set()
@@ -643,4 +649,5 @@ if st.session_state.last_sources:
             st.write(snippet)
 
 st.markdown("</div>", unsafe_allow_html=True)
+
 
