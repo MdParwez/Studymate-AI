@@ -1,12 +1,4 @@
 # app.py
-"""
-StudyMate AI — Final customer-ready RAG app (single file)
-- Keep original behavior/prompts
-- Improve speed: parallel page extraction (per-file), batched embeddings
-- If chroma direct client available, add embeddings with collection.add(...) for speed
-- Polished assistant SVG icon and nicer summary/quiz cards
-"""
-
 import os
 import math
 import re
@@ -651,3 +643,4 @@ if st.session_state.last_sources:
             st.write(snippet)
 
 st.markdown("</div>", unsafe_allow_html=True)
+
