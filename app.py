@@ -1,151 +1,116 @@
 # app.py
+"""
+StudyMate AI — Customer-ready single-file Streamlit RAG app (IN-MEMORY)
+Features:
+ - PyMuPDF parallel extraction
+ - SentenceTransformers (all-MiniLM-L6-v2) batched embeddings
+ - In-memory vector store (numpy) + cosine similarity retrieval
+ - Optional cross-encoder reranking (lazy)
+ - Groq/Gemma chat completions for Q&A, summaries, quizzes
+ - Styled UI: chat bubbles, assistant SVG, quiz cards, smart actions, pinned sources
+ - Session-only recent chats, automatic save when starting new conversation
+"""
 import os
 import math
 import re
 import uuid
-from typing import List
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
-
-# Try modern LangChain package names (to address deprecation warnings).
-# If not installed, fall back to community wrappers.
-try:
-    # recommended packages
-    from langchain_huggingface import HuggingFaceEmbeddings as LCHF_Embeddings
-    from langchain_chroma import Chroma as LC_Chroma
-    EMBEDDINGS_BACKEND = "langchain_huggingface"
-    _USE_NEW_LANGCHAIN = True
-except Exception:
-    # fallback to community packages (older)
-    from langchain_community.embeddings import SentenceTransformerEmbeddings as LCH_Embeddings
-    from langchain_community.vectorstores import Chroma as LCC_Chroma
-    EMBEDDINGS_BACKEND = "langchain_community"
-    _USE_NEW_LANGCHAIN = False
-
-# Use whichever Chroma class is available
-ChromaClass = LC_Chroma if _USE_NEW_LANGCHAIN else LCC_Chroma
-EmbeddingsClass = LCHF_Embeddings if _USE_NEW_LANGCHAIN else LCH_Embeddings
-
-# LangChain text splitter & schema (same API)
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-
-# Groq SDK for Gemma usage
+import numpy as np
+from sentence_transformers import SentenceTransformer
 from groq import Groq
 
-# Cross-encoder lazy import placeholder
-_crossencoder = None
-
-# sentence-transformers (for batch embeddings)
-from sentence_transformers import SentenceTransformer
-
-# -------------------------
-# Basic config & constants
-# -------------------------
+# --- Config (defaults) ---
 load_dotenv()
 st.set_page_config(page_title="StudyMate AI", layout="wide")
 PRIMARY = "#a855f7"
+BANNER_URL = "https://images.unsplash.com/photo-1507842217343-583bb7270b66?q=80&w=1400&auto=format&fit=crop"
+SIDEBAR_BOOK_ICON = "https://cdn-icons-png.flaticon.com/512/29/29302.png"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY missing. Put GROQ_API_KEY=your_key in a .env file and restart.")
+    st.error("GROQ_API_KEY missing — add to .env (GROQ_API_KEY=...) and restart.")
     st.stop()
-
 GEMMA_MODEL = "gemma2-9b-it"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # fast and compact
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 50   # as you wanted to keep
-TOP_K = 8            # retrieval size (internal)
-EMBED_BATCH_SIZE = 64  # embed batch size
 
-# UI images (replace if you want)
-BANNER_URL = "https://images.unsplash.com/photo-1507842217343-583bb7270b66?q=80&w=1400&auto=format&fit=crop"
-SIDEBAR_BOOK_ICON = "https://cdn-icons-png.flaticon.com/512/29/29302.png"
-SIDEBAR_LIBRARY_IMG = "https://images.unsplash.com/photo-1524995997946-a1c2e315a42f?q=80&w=800&auto=format&fit=crop"
+# default chunk settings (you asked chunk size 50)
+DEFAULT_CHUNK_SIZE = 50
+DEFAULT_CHUNK_OVERLAP = 20
 
-# -------------------------
-# Styling and SVGs
-# -------------------------
-ASSISTANT_SVG = """
-<img src="data:image/svg+xml;utf8,
-<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' width='22' height='22'>
-  <defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop offset='0' stop-color='%23a855f7'/><stop offset='1' stop-color='%236b21a8'/></linearGradient></defs>
-  <rect x='8' y='12' width='48' height='36' rx='6' fill='url(%23g)'/>
-  <circle cx='24' cy='28' r='3.2' fill='%23fff'/>
-  <circle cx='40' cy='28' r='3.2' fill='%23fff'/>
-  <rect x='22' y='38' width='20' height='3' rx='1.5' fill='%23fff' opacity='0.9'/>
-  <rect x='28' y='8' width='8' height='6' rx='2' fill='%23a855f7'/>
-</svg>"/>
-"""
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # fast & compact
+EMBED_BATCH_SIZE = 64
+PAGE_EXTRACT_WORKERS = 6
+TOP_K_DEFAULT = 8
 
-st.markdown(
-    f"""
-    <style>
-    :root {{ --primary: {PRIMARY}; }}
-    [data-testid="stSidebar"] {{ padding: 1rem; }}
-    .header-card {{ background-color: {PRIMARY}; padding:16px; border-radius:10px; color: white; display:flex; gap:16px; align-items:center; }}
-    .chat-user {{ background: linear-gradient(90deg, rgba(168,85,247,0.12), rgba(168,85,247,0.08)); border-left: 4px solid var(--primary); padding:10px; border-radius:10px; margin:8px 0; display:flex; gap:8px; align-items:flex-start; }}
-    .chat-assistant {{ background:#f3f4f6; padding:10px; border-radius:10px; margin:8px 0; display:flex; gap:8px; align-items:flex-start; }}
-    .icon-left {{ width:26px; height:26px; margin-top:2px; }}
-    .quiz-card {{ border:1px solid #eee; padding:14px; border-radius:10px; margin-bottom:12px; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,0.03); }}
-    .question-badge {{ display:inline-block; background:var(--primary); color:white; padding:6px 10px; border-radius:12px; font-weight:700; margin-right:10px; }}
-    .correct {{ color: green; font-weight:700; }}
-    .summary-card {{ border-left:6px solid var(--primary); padding:12px; border-radius:8px; background:#fff; box-shadow:0 2px 6px rgba(0,0,0,0.03); margin-bottom:12px; }}
-    .small-muted {{ color:#666; font-size:13px; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# --- Styling & SVG ---
+ASSISTANT_SVG = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' width='26' height='26'>
+<defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop offset='0' stop-color='#a855f7'/><stop offset='1' stop-color='#6b21a8'/></linearGradient></defs>
+<rect x='8' y='12' width='48' height='36' rx='6' fill='url(#g)'/>
+<circle cx='24' cy='28' r='3.2' fill='#fff'/>
+<circle cx='40' cy='28' r='3.2' fill='#fff'/>
+<rect x='22' y='38' width='20' height='3' rx='1.5' fill='#fff' opacity='0.9'/>
+</svg>"""
 
-# -------------------------
-# Prompts (unchanged)
-# -------------------------
+st.markdown(f"""
+<style>
+:root {{ --p1: {PRIMARY}; --p2: #6b21a8; }}
+body {{ font-family: Inter, Roboto, system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial; }}
+.header-card {{ background: linear-gradient(90deg,var(--p1),var(--p2)); padding:16px; border-radius:10px; color:white; display:flex; gap:16px; align-items:center; margin-bottom:10px; }}
+.sidebar-book {{ width:64px; height:64px; }}
+.chat-row {{ display:flex; gap:12px; margin:8px 0; align-items:flex-start; }}
+.chat-user {{ justify-content:flex-end; }}
+.bubble {{ padding:12px 14px; border-radius:14px; max-width:85%; line-height:1.35; box-shadow: 0 6px 18px rgba(0,0,0,0.04); animation: fadeIn 180ms ease-in; }}
+.bubble.user {{ background: linear-gradient(90deg,var(--p1),var(--p2)); color:white; border-bottom-right-radius:6px; }}
+.bubble.assistant {{ background:#ffffff; color:#111827; border:1px solid #eee; border-bottom-left-radius:6px; }}
+.icon-left {{ width:36px; height:36px; display:flex; align-items:center; justify-content:center; }}
+.summary-card {{ border-left:6px solid var(--p1); padding:12px; border-radius:8px; background:#fff; margin-bottom:12px; }}
+.quiz-card {{ border:1px solid #eee; padding:14px; border-radius:10px; margin-bottom:12px; background:#fff; box-shadow: 0 2px 6px rgba(0,0,0,0.03); }}
+.action-btn {{ background: linear-gradient(90deg,var(--p1),var(--p2)); color: white; padding:6px 10px; border-radius:8px; border: none; cursor: pointer; }}
+.source-row {{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-bottom:1px dashed #f6f6f6; }}
+.pinned {{ background:#fff8e6; padding:6px; border-radius:6px; border:1px solid #ffe6a7; margin-bottom:6px; }}
+@keyframes fadeIn {{ from {{ opacity:0; transform: translateY(6px) }} to {{ opacity:1; transform: translateY(0) }} }}
+.stChatInput {{ margin-top: 8px !important; }}
+</style>
+""", unsafe_allow_html=True)
+
+# --- Prompts ---
 QNA_SYSTEM = """
 You are StudyMate, a friendly and accurate study assistant. Use ONLY the provided context passages.
-- If the topic or keyword appears in the context, return the relevant details from the context.
-- Do NOT invent facts or use outside knowledge.
-- If the answer is not present in the provided context, reply exactly: "I could not find the answer in the provided material."
-- When you reference a fact, add a friendly source note like: (from filename.pdf)
-Answer in a simple, customer-friendly tone.
+- If the topic appears in the context, return relevant details.
+- If the answer is not present, reply exactly: "I could not find the answer in the provided material."
+- When referencing facts, include citation tokens like [1], [2].
+Answer concisely and in a friendly tone.
 """
-
 SUMMARY_SYSTEM = """
-You are StudyMate, expert teaching assistant. Using ONLY the provided context, OUTPUT in Markdown:
+You are StudyMate, an expert teaching assistant. Using ONLY the provided context produce EXACT Markdown:
 
 ### Summary
-<3–6 sentences overview>
+<3-6 sentences>
 
 ### Study Notes
-- 5–7 concise bullets
+- bullet points
 
 ### Key Definitions
-- **Term**: short definition
-
-If insufficient info, say: "The provided material does not contain enough information to summarize fully."
+- **Term**: definition
 """
-
 QUIZ_SYSTEM = """
-You are StudyMate, a quiz generator. Using ONLY the provided context, create EXACTLY 5 multiple-choice questions.
-Output strictly in this format for each question:
+You are StudyMate, a quiz generator. Using ONLY the provided context produce EXACTLY 5 MCQs in this format:
 
-Q1. Question text
-A. option
-B. option
-C. option
-D. option
+Q1. question?
+A. opt
+B. opt
+C. opt
+D. opt
 Answer: X
-
-Rules:
-- Do not use outside knowledge.
-- Make questions clear and relevant to the context.
 """
 
 # -------------------------
-# Utilities (PDF extraction, LLM call, rerank, rewrite)
+# Helpers: PDF extraction & chunking
 # -------------------------
 def extract_page_text(page):
     try:
@@ -153,16 +118,10 @@ def extract_page_text(page):
     except Exception:
         return ""
 
-def extract_text_from_pdf_parallel(file_bytes: bytes, max_workers: int = 6) -> str:
-    """
-    Extract text from PDF pages in parallel (per-file).
-    Returns concatenated text.
-    """
-    text = ""
+def extract_pages_parallel(file_bytes: bytes, max_workers: int = PAGE_EXTRACT_WORKERS) -> List[str]:
     with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
-        pages = list(pdf)  # list of page objects
+        pages = list(pdf)
         results = [None] * len(pages)
-        # Use ThreadPoolExecutor to extract page text in parallel
         with ThreadPoolExecutor(max_workers=min(max_workers, len(pages))) as ex:
             futures = {ex.submit(extract_page_text, p): idx for idx, p in enumerate(pages)}
             for fut in as_completed(futures):
@@ -171,27 +130,105 @@ def extract_text_from_pdf_parallel(file_bytes: bytes, max_workers: int = 6) -> s
                     results[idx] = fut.result()
                 except Exception:
                     results[idx] = ""
-        # join in page order
-        text = "\n\n".join(results)
-    return text
+    return results  # list of page texts in order
 
-def call_groq_chat(messages: List[dict], model: str = GEMMA_MODEL, max_tokens: int = 1024, temperature: float = 0.0) -> str:
-    client = Groq(api_key=GROQ_API_KEY)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    return resp.choices[0].message.content
+def chunk_texts(pages_texts: List[str], chunk_size: int, chunk_overlap: int) -> List[Dict[str, Any]]:
+    """
+    Return list of {"text":..., "metadata": {"source":filename, "page":pno, "chunk_index":i}}
+    We call this after we already mapped which pages belong to which file.
+    """
+    splitter = []
+    # We will do a simple sliding splitter per page to respect chunk_size & overlap
+    chunks = []
+    for pno, pt in enumerate(pages_texts):
+        if not pt or not pt.strip():
+            continue
+        tokens = pt.split()
+        if len(tokens) <= chunk_size:
+            chunks.append(" ".join(tokens))
+        else:
+            i = 0
+            while i < len(tokens):
+                chunk_tokens = tokens[i:i+chunk_size]
+                chunks.append(" ".join(chunk_tokens))
+                if i+chunk_size >= len(tokens):
+                    break
+                i = max(i + chunk_size - chunk_overlap, i+1)
+    return chunks
 
-def rewrite_short_query_for_retrieval(query: str) -> str:
-    if len(query.strip().split()) <= 2:
-        return f"What do the provided documents say about {query.strip()}?"
-    return query
+# -------------------------
+# In-memory vector store
+# -------------------------
+class InMemoryVectorStore:
+    def __init__(self):
+        self.embeddings = []       # list of lists
+        self.texts = []            # chunk texts
+        self.metadatas = []        # metadata dicts
+        self.ids = []              # ids
+        self.matrix = None         # numpy matrix of embeddings for fast search
 
-# Cross-encoder (lazy) - reranking enabled by default internally
-def lazy_load_crossencoder():
+    def add(self, texts: List[str], metadatas: List[dict], ids: Optional[List[str]] = None, embs: Optional[List[List[float]]] = None):
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in texts]
+        if embs is None:
+            # caller must ensure embeddings computed else throw
+            raise ValueError("Embeddings not provided to add()")
+        self.ids.extend(ids)
+        self.texts.extend(texts)
+        self.metadatas.extend(metadatas)
+        self.embeddings.extend(embs)
+        self.matrix = np.vstack(self.embeddings) if self.embeddings else None
+
+    def similarity_search(self, query_emb: List[float], k: int = 8):
+        if self.matrix is None or len(self.texts) == 0:
+            return []
+        q = np.array(query_emb, dtype=float).reshape(1, -1)
+        # cosine similarity
+        norms = np.linalg.norm(self.matrix, axis=1) * np.linalg.norm(q)
+        dots = (self.matrix @ q.T).squeeze()
+        # avoid div by zero
+        denom = norms
+        denom[denom == 0] = 1e-8
+        sims = dots / denom
+        idxs = np.argsort(-sims)[:k]
+        results = []
+        for idx in idxs:
+            results.append({
+                "id": self.ids[int(idx)],
+                "text": self.texts[int(idx)],
+                "metadata": self.metadatas[int(idx)],
+                "score": float(sims[int(idx)])
+            })
+        return results
+
+# -------------------------
+# LLM / Embedding init
+# -------------------------
+# load SBERT model for batch encoding
+@st.cache_resource(show_spinner=False)
+def get_sbert(model_name=EMBEDDING_MODEL_NAME):
+    return SentenceTransformer(model_name)
+
+sbert = get_sbert()
+
+def embed_texts(texts: List[str], batch_size=EMBED_BATCH_SIZE):
+    embs = []
+    # sentence-transformers encode in batches efficiently
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        vectors = sbert.encode(batch, show_progress_bar=False, convert_to_numpy=True)
+        embs.extend([v.tolist() for v in vectors])
+    return embs
+
+@st.cache_resource(show_spinner=False)
+def get_inmem_store():
+    return InMemoryVectorStore()
+
+store = get_inmem_store()
+
+# Cross-encoder reranker (lazy)
+_crossencoder = None
+def lazy_crossencoder():
     global _crossencoder
     if _crossencoder is None:
         try:
@@ -201,453 +238,328 @@ def lazy_load_crossencoder():
             _crossencoder = None
     return _crossencoder
 
-def rerank_with_crossencoder(query: str, docs: List[Document]) -> List[Document]:
-    model = lazy_load_crossencoder()
-    if not model:
-        return docs
-    pairs = [[query, d.page_content] for d in docs]
+def rerank(query: str, hits: List[dict]) -> List[dict]:
+    model = lazy_crossencoder()
+    if not model or not hits:
+        return hits
+    pairs = [[query, h["text"]] for h in hits]
     scores = model.predict(pairs)
-    scored = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-    return [d for d, _ in scored]
+    scored = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
+    return [h for h, s in scored]
+
+# Groq LLM call
+def call_groq_chat(messages: List[dict], model=GEMMA_MODEL, max_tokens=512, temperature=0.0):
+    client = Groq(api_key=GROQ_API_KEY)
+    resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+    return resp.choices[0].message.content
 
 # -------------------------
-# Session state initialization (unchanged)
+# Session state init
 # -------------------------
-if "embeddings" not in st.session_state:
-    try:
-        st.session_state.embeddings = EmbeddingsClass(model_name=EMBEDDING_MODEL_NAME)
-    except Exception:
-        try:
-            st.session_state.embeddings = EmbeddingsClass()
-        except Exception:
-            # fallback to sentence-transformers model for batch encode
-            st.session_state._sbert = SentenceTransformer(EMBEDDING_MODEL_NAME)
-            st.session_state.embeddings = None
-
-if "chroma_db" not in st.session_state:
-    try:
-        # Try normal Chroma
-        st.session_state.chroma_db = ChromaClass(
-            embedding_function=st.session_state.embeddings,
-            persist_directory=None
-        )
-        st.session_state._chroma_direct = False
-    except RuntimeError as e:
-        # If SQLite is too old or unsupported, fallback to DuckDB+Parquet mode
-        import chromadb
-        from chromadb.config import Settings
-        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet",
-                                          persist_directory=".chromadb"))
-        try:
-            collection = client.get_collection("studymate")
-        except Exception:
-            collection = client.create_collection("studymate")
-        st.session_state.chroma_db = collection
-        st.session_state._chroma_direct = True
-
-
 if "indexed_files" not in st.session_state:
     st.session_state.indexed_files = set()
-if "all_docs" not in st.session_state:
-    st.session_state.all_docs = []
+if "all_chunks" not in st.session_state:
+    st.session_state.all_chunks = []      # store texts + metadata for summarization
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "last_sources" not in st.session_state:
-    st.session_state.last_sources = []
+    st.session_state.chat_history = []    # list of dicts {role, content, meta?}
+if "last_retrieved" not in st.session_state:
+    st.session_state.last_retrieved = []  # last retrieval hits
+if "pinned_sources" not in st.session_state:
+    st.session_state.pinned_sources = []  # list of metadata dicts
+if "recent_chats" not in st.session_state:
+    st.session_state.recent_chats = []    # session-only saved chats
 
 # -------------------------
-# Sidebar UI (unchanged)
+# Sidebar UI (upload + settings)
 # -------------------------
 with st.sidebar:
     st.image(SIDEBAR_BOOK_ICON, width=80)
-    st.image(SIDEBAR_LIBRARY_IMG, use_container_width=True)
     st.markdown(f"<h2 style='color:{PRIMARY};margin:6px 0 4px 0'>StudyMate AI</h2>", unsafe_allow_html=True)
-    st.markdown("<div style='color:#444;margin-bottom:8px;'>Upload PDFs/TXT — ask questions, summarize chapters, and generate quizzes.</div>", unsafe_allow_html=True)
+    st.markdown("<div style='color:#444;margin-bottom:6px;'>Upload PDFs/TXT — ask questions, summarize chapters, and generate quizzes.</div>", unsafe_allow_html=True)
 
-    uploaded_files = st.file_uploader("Upload files (PDF / TXT)", type=["pdf", "txt"], accept_multiple_files=True)
+    # Settings
+    st.markdown("## Settings")
+    chunk_size = st.slider("Chunk size (words)", 20, 400, value=DEFAULT_CHUNK_SIZE, step=5, help="How many words per chunk")
+    chunk_overlap = st.slider("Chunk overlap (words)", 0, 200, value=DEFAULT_CHUNK_OVERLAP, step=5, help="Overlap between chunks for coherence")
+    top_k = st.slider("Top-k retrieval", 1, 12, value=TOP_K_DEFAULT)
+    rerank_enabled = st.checkbox("Enable reranking (slower)", value=True, help="Use cross-encoder to rerank retrieved chunks")
+    st.markdown("---")
+
+    uploaded_files = st.file_uploader("Upload PDFs / TXT (multiple)", type=["pdf", "txt"], accept_multiple_files=True)
 
     st.markdown("---")
     if st.button("📝 Summarize Uploaded Docs"):
         st.session_state._run_summarize = True
     if st.button("🎯 Generate Quiz (5 Qs)"):
         st.session_state._run_quiz = True
-
     st.markdown("---")
     if st.button("➕ New Conversation"):
-        st.session_state.chat_history = []
-        st.session_state.last_sources = []
-        st.success("Starting a new conversation — ready when you are.")
+        # auto-save conversation to recent_chats (session-only)
+        if st.session_state.chat_history:
+            title = st.session_state.chat_history[0]["content"][:48]
+            st.session_state.recent_chats.insert(0, {"title": title, "messages": st.session_state.chat_history.copy(), "ts": datetime.now().isoformat()})
+            st.session_state.chat_history = []
+            st.session_state.last_retrieved = []
+            st.success("Started a new conversation — previous saved in recent chats (session).")
+
+    st.markdown("## Recent Chats (session)")
+    for i, rc in enumerate(st.session_state.recent_chats):
+        cols = st.columns([0.8, 0.2])
+        with cols[0]:
+            if st.button(rc["title"], key=f"load_{i}"):
+                st.session_state.chat_history = rc["messages"].copy()
+        with cols[1]:
+            if st.button("❌", key=f"del_{i}"):
+                st.session_state.recent_chats.pop(i)
+                st.experimental_rerun()
 
 # -------------------------
-# Main header (unchanged)
+# Main header
 # -------------------------
-st.markdown('<div class="main-container">', unsafe_allow_html=True)
-st.markdown(
-    f"""
-    <div class="header-card">
-        <div style="flex-shrink:0;">
-            <img src="{BANNER_URL}" width="240" style="border-radius:8px;">
-        </div>
-        <div>
-            <h1 style="color:white;margin:0;">StudyMate AI</h1>
-            <p style="color:#f0f0f0;margin:4px 0 0 0;">Your friendly study assistant — upload documents, ask questions, learn & quiz yourself.</p>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.markdown("")  # spacing
+st.markdown(f"""<div class="header-card">
+    <div style="flex-shrink:0;"><img src="{BANNER_URL}" width="220" style="border-radius:8px;"></div>
+    <div><h1 style="margin:0">StudyMate AI</h1><div style="opacity:.9">Your friendly study assistant — upload documents, ask questions, quiz yourself.</div></div>
+</div>""", unsafe_allow_html=True)
 
 # -------------------------
-# Handle uploads: chunk + embed + add; sequential file processing with per-file progress
+# Handle uploads (sequential per-file; parallel per-page; batched embeddings)
 # -------------------------
 if uploaded_files:
-    new_docs = []
     added_any = False
-
-    # sequentially process each file (safe on memory)
-    for file_idx, uploaded in enumerate(uploaded_files, start=1):
+    for uploaded in uploaded_files:
         if uploaded.name in st.session_state.indexed_files:
-            st.info(f"File '{uploaded.name}' already indexed in this session — skipping.")
+            st.info(f"'{uploaded.name}' already indexed this session; skipping.")
             continue
-
         file_bytes = uploaded.read()
-        file_size_mb = len(file_bytes) / (1024 * 1024)
-        status = st.info(f"Processing file {file_idx}/{len(uploaded_files)}: {uploaded.name} ({file_size_mb:.2f} MB)")
+        file_mb = len(file_bytes) / (1024*1024)
+        status = st.info(f"Processing {uploaded.name} ({file_mb:.2f} MB)")
 
-        # 1) extract pages in parallel
-        with st.spinner("Extracting text (parallel per-page)..."):
+        # extract pages in parallel
+        with st.spinner("Extracting pages..."):
             try:
-                text = extract_text_from_pdf_parallel(file_bytes, max_workers=6)
+                pages_texts = extract_pages_parallel(file_bytes, max_workers=PAGE_EXTRACT_WORKERS)
             except Exception:
-                # fallback to serial extraction if parallel fails
-                text = ""
+                # fallback serial
+                pages_texts = []
                 with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
-                    for page in pdf:
-                        text += page.get_text() + "\n\n"
+                    for p in pdf:
+                        pages_texts.append(p.get_text())
 
-        # 2) chunk
-        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-        chunks = splitter.split_text(text)
+        # chunk per page & preserve ordering
+        chunks = []
+        chunk_metadatas = []
+        for pno, ptext in enumerate(pages_texts, start=1):
+            page_chunks = chunk_texts([ptext], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            for ci, ch in enumerate(page_chunks):
+                chunks.append(ch)
+                chunk_metadatas.append({"source": uploaded.name, "page": pno, "chunk_index": len(chunks)-1})
+
         total_chunks = len(chunks)
-        status.info(f"Processing file {file_idx}/{len(uploaded_files)}: {uploaded.name} — {total_chunks} chunks")
+        if total_chunks == 0:
+            status.error(f"No text found in {uploaded.name}; skipping.")
+            continue
+        status.info(f"Embedding {total_chunks} chunks (this can take a moment)...")
 
-        # 3) embed chunks in batches (using sentence-transformers encode for speed)
-        # prefer st.session_state._sbert if available or embeddings wrapper if it exposes batch encode
-        batch_size = EMBED_BATCH_SIZE
-        embeddings_list = []
-        ids = []
-        metadatas = []
-        documents_texts = []
+        # compute embeddings in batches (use sbert.encode)
+        embs = embed_texts(chunks, batch_size=EMBED_BATCH_SIZE)
 
-        progress = st.progress(0.0)
-        for start in range(0, total_chunks, batch_size):
-            end = min(start + batch_size, total_chunks)
-            batch_chunks = chunks[start:end]
-            # compute embeddings using underlying sbert model if available
-            if hasattr(st.session_state, "_sbert"):
-                embs = st.session_state._sbert.encode(batch_chunks, show_progress_bar=False, convert_to_numpy=True)
-                # embs is numpy array; convert to list
-                for i, chunk_text in enumerate(batch_chunks):
-                    uid = str(uuid.uuid4())
-                    ids.append(uid)
-                    documents_texts.append(chunk_text)
-                    metadatas.append({"source": uploaded.name, "chunk_index": start + i})
-                    embeddings_list.append(embs[i].tolist())
-            else:
-                # try using embeddings wrapper if it has embed_documents or embed_texts
-                if st.session_state.embeddings is not None:
-                    try:
-                        # Some wrappers provide embed_documents
-                        embs = st.session_state.embeddings.embed_documents(batch_chunks)
-                        for i, chunk_text in enumerate(batch_chunks):
-                            uid = str(uuid.uuid4())
-                            ids.append(uid)
-                            documents_texts.append(chunk_text)
-                            metadatas.append({"source": uploaded.name, "chunk_index": start + i})
-                            embeddings_list.append(embs[i])
-                    except Exception:
-                        # last resort: no embeddings available, just add documents (will be embedded by Chroma)
-                        for i, chunk_text in enumerate(batch_chunks):
-                            uid = str(uuid.uuid4())
-                            ids.append(uid)
-                            documents_texts.append(chunk_text)
-                            metadatas.append({"source": uploaded.name, "chunk_index": start + i})
-                            embeddings_list.append(None)
-                else:
-                    # no embeddings available
-                    for i, chunk_text in enumerate(batch_chunks):
-                        uid = str(uuid.uuid4())
-                        ids.append(uid)
-                        documents_texts.append(chunk_text)
-                        metadatas.append({"source": uploaded.name, "chunk_index": start + i})
-                        embeddings_list.append(None)
-
-            progress.progress(min(end / max(total_chunks, 1), 1.0))
-
-        progress.empty()
-
-        # 4) add to vector DB:
-        # if direct chroma client collection is used (_chroma_direct True), we can pass precomputed embeddings
+        # add to in-memory store
         try:
-            if getattr(st.session_state, "_chroma_direct", False):
-                # remove None embeddings if any (chroma requires numeric vectors)
-                valid_ids, valid_docs, valid_metas, valid_embs = [], [], [], []
-                for i, emb in enumerate(embeddings_list):
-                    if emb is not None:
-                        valid_ids.append(ids[i])
-                        valid_docs.append(documents_texts[i])
-                        valid_metas.append(metadatas[i])
-                        valid_embs.append(embeddings_list[i])
-                if valid_ids:
-                    st.session_state.chroma_db.add(
-                        ids=valid_ids,
-                        documents=valid_docs,
-                        metadatas=valid_metas,
-                        embeddings=valid_embs
-                    )
-                else:
-                    # fallback to add documents only (let chroma compute embeddings)
-                    st.session_state.chroma_db.add(documents=documents_texts, metadatas=metadatas, ids=ids)
-            else:
-                # use add_documents fallback (signature may compute embeddings internally)
-                docs_to_add = [Document(page_content=t, metadata=m) for t, m in zip(documents_texts, metadatas)]
-                try:
-                    st.session_state.chroma_db.add_documents(docs_to_add)
-                except Exception:
-                    # try alternate signature
-                    try:
-                        st.session_state.chroma_db.add_documents(docs_to_add, embedding=st.session_state.embeddings)
-                    except Exception:
-                        # as last resort, ignore some add errors but append to all_docs so retrieval may still work for some backends
-                        pass
-        except Exception:
-            # swallow DB insertion errors but continue
-            pass
+            store.add(texts=chunks, metadatas=chunk_metadatas, ids=[str(uuid.uuid4()) for _ in chunks], embs=embs)
+        except Exception as e:
+            # if something goes wrong, append to session-level fallback
+            st.warning("Failed to add to in-memory store: " + str(e))
 
-        # append to session-level all_docs for future summarization logic
-        for t, m in zip(documents_texts, metadatas):
-            st.session_state.all_docs.append(Document(page_content=t, metadata=m))
+        # append to session all_chunks for summarization
+        for t, m in zip(chunks, chunk_metadatas):
+            st.session_state.all_chunks.append({"text": t, "metadata": m})
 
-        # mark indexed & UI
         st.session_state.indexed_files.add(uploaded.name)
-        status.success(f"Indexed '{uploaded.name}' ✅")
+        status.success(f"Indexed '{uploaded.name}' ({total_chunks} chunks) ✅")
         added_any = True
 
-        # per user's request: clear current chat & last_sources on new upload to start fresh
-        st.session_state.chat_history = []
-        st.session_state.last_sources = []
-
     if added_any:
-        st.success("All set — your study materials are ready! Ask a question or generate a summary/quiz.")
+        # clear chat for fresh start (per your earlier preference)
+        st.session_state.chat_history = []
+        st.session_state.last_retrieved = []
+        st.success("All uploads processed in memory — ready to ask questions.")
 
 st.markdown("---")
 
 # -------------------------
-# Retrieval function (unchanged)
+# Retrieval helpers (embedding query + similarity)
 # -------------------------
-def retrieve_for_query(query: str, k: int = TOP_K) -> List[Document]:
-    # If using chromadb direct collection
-    if getattr(st.session_state, "_chroma_direct", False):
+def retrieve(query: str, k: int = TOP_K_DEFAULT, rerank_flag: bool = True):
+    q_emb = sbert.encode([query], convert_to_numpy=True)[0].tolist()
+    hits = store.similarity_search(q_emb, k=k)
+    if rerank_flag:
         try:
-            # compute query embedding with sbert if available
-            if hasattr(st.session_state, "_sbert"):
-                q_emb = st.session_state._sbert.encode([query], convert_to_numpy=True)[0].tolist()
-                res = st.session_state.chroma_db.query(query_embeddings=[q_emb], n_results=k, include=["documents","metadatas"])
-                doc_texts = res.get("documents", [[]])[0]
-                metadatas = res.get("metadatas", [[]])[0]
-                docs = [Document(page_content=dt, metadata=md) for dt, md in zip(doc_texts, metadatas)]
-            else:
-                res = st.session_state.chroma_db.query(query_texts=[query], n_results=k, include=["documents","metadatas"])
-                doc_texts = res.get("documents", [[]])[0]
-                metadatas = res.get("metadatas", [[]])[0]
-                docs = [Document(page_content=dt, metadata=md) for dt, md in zip(doc_texts, metadatas)]
+            hits = rerank(query, hits)
         except Exception:
-            docs = []
-    else:
-        try:
-            docs = st.session_state.chroma_db.similarity_search(query, k=k)
-        except Exception:
-            docs = []
-
-    # internal reranking (lazy)
-    try:
-        docs = rerank_with_crossencoder(query, docs)
-    except Exception:
-        pass
-
-    st.session_state.last_sources = docs
-    return docs
+            pass
+    st.session_state.last_retrieved = hits
+    return hits
 
 # -------------------------
-# Summarization helpers (unchanged)
-# -------------------------
-SUMMARY_BATCH_CHUNKS = 8
-SUMMARY_BATCH_LIMIT = 40
-
-def summarize_batches(docs: List[Document], batch_size: int = SUMMARY_BATCH_CHUNKS) -> List[str]:
-    partials = []
-    docs_to_use = docs[:SUMMARY_BATCH_LIMIT]
-    if not docs_to_use:
-        return partials
-    num_batches = math.ceil(len(docs_to_use) / batch_size)
-    prog = st.progress(0)
-    for i in range(num_batches):
-        start = i * batch_size
-        end = min(start + batch_size, len(docs_to_use))
-        batch = docs_to_use[start:end]
-        snippets = []
-        chars_limit = 900
-        for d in batch:
-            txt = d.page_content.strip()
-            if len(txt) > chars_limit:
-                txt = txt[:chars_limit] + " ..."
-            snippets.append(f"Source: {d.metadata.get('source','uploaded_doc')}\n{txt}")
-        context_block = "\n\n".join(snippets)
-        messages = [
-            {"role": "system", "content": SUMMARY_SYSTEM},
-            {"role": "user", "content": f"Context:\n{context_block}"}
-        ]
-        try:
-            partial = call_groq_chat(messages, temperature=0.3, max_tokens=700)
-        except Exception:
-            partial = "Partial summary failed for this batch."
-        partials.append(partial)
-        prog.progress((i + 1) / num_batches)
-    prog.empty()
-    return partials
-
-def synthesize_final_summary(partials: List[str]) -> str:
-    if not partials:
-        return "The provided material does not contain enough information to summarize fully."
-    joined = "\n\n".join(partials[:20])
-    prompt = (
-        "You are StudyMate, an expert teaching assistant. Combine the following partial summaries into ONE final output in Markdown format with headings 'Summary', 'Study Notes', and 'Key Definitions'.\n\n"
-        "Partial summaries:\n" + joined
-    )
-    messages = [{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": prompt}]
-    try:
-        final = call_groq_chat(messages, temperature=0.3, max_tokens=800)
-    except Exception:
-        final = "Failed to synthesize final summary."
-    return final
-
-# -------------------------
-# Summarize & Quiz triggers (render changes for nicer cards)
+# Summarize / Quiz actions -> put into main chat
 # -------------------------
 if st.session_state.pop("_run_summarize", False):
-    if not st.session_state.all_docs:
-        st.warning("No documents uploaded yet. Please upload files to summarize.")
+    if not st.session_state.all_chunks:
+        st.warning("No uploaded content to summarize.")
     else:
-        st.info("Creating a structured summary for your materials...")
-        partials = summarize_batches(st.session_state.all_docs, batch_size=SUMMARY_BATCH_CHUNKS)
-        final_summary = synthesize_final_summary(partials)
-        # render inside a styled summary card
-        st.markdown("<div class='summary-card'>", unsafe_allow_html=True)
-        st.markdown(final_summary, unsafe_allow_html=False)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.session_state.chat_history.append({"role": "assistant", "content": final_summary})
+        # sample top N chunks for summarization
+        sample_texts = [c["text"] for c in st.session_state.all_chunks[:min(len(st.session_state.all_chunks), 200)]]
+        context_block = "\n\n".join(sample_texts[:120])
+        messages = [{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": f"Context:\n{context_block}"}]
+        with st.spinner("Generating structured summary..."):
+            try:
+                out = call_groq_chat(messages, temperature=0.3, max_tokens=800)
+            except Exception as e:
+                out = "Summarization failed: " + str(e)
+        st.session_state.chat_history.append({"role": "assistant", "content": out, "meta": {"type": "summary"}})
 
 if st.session_state.pop("_run_quiz", False):
-    if not st.session_state.all_docs:
-        st.warning("No documents uploaded yet. Please upload files to generate a quiz.")
+    if not st.session_state.all_chunks:
+        st.warning("No uploaded content to generate quiz.")
     else:
-        results = retrieve_for_query("quiz", k=TOP_K)
-        snippets = [d.page_content[:1200] for d in results]
+        # retrieve some chunks as context
+        hits = retrieve("quiz", k=top_k, rerank_flag=rerank_enabled)
+        snippets = [h["text"][:1200] for h in hits]
         context_block = "\n\n".join(snippets)
         messages = [{"role": "system", "content": QUIZ_SYSTEM}, {"role": "user", "content": f"Context:\n{context_block}"}]
-        try:
-            raw_quiz = call_groq_chat(messages, temperature=0.5, max_tokens=700)
-            # store and render nicely
-            st.session_state.chat_history.append({"role": "assistant", "content": raw_quiz, "meta": {"type": "quiz"}})
-        except Exception as e:
-            st.error(f"Quiz generation failed: {e}")
+        with st.spinner("Generating quiz..."):
+            try:
+                out = call_groq_chat(messages, temperature=0.5, max_tokens=700)
+            except Exception as e:
+                out = "Quiz generation failed: " + str(e)
+        st.session_state.chat_history.append({"role": "assistant", "content": out, "meta": {"type": "quiz"}})
 
 # -------------------------
-# Chat input (unchanged)
+# Chat input (Q&A)
 # -------------------------
-user_input = st.chat_input("Ask anything about your uploaded documents...")
+user_input = st.chat_input("Ask anything about the uploaded documents...")
 if user_input:
-    original_query = user_input.strip()
-    retrieval_query = rewrite_short_query_for_retrieval(original_query)
-
-    st.session_state.chat_history.append({"role": "user", "content": original_query})
-
-    if not st.session_state.all_docs:
-        st.warning("No documents uploaded. Please upload PDFs/TXT on the left.")
+    original = user_input.strip()
+    st.session_state.chat_history.append({"role": "user", "content": original})
+    if not store.texts:
+        st.warning("No documents indexed — upload PDFs on the left.")
     else:
-        with st.spinner("Looking up your materials..."):
-            results = retrieve_for_query(retrieval_query, k=TOP_K)
-
-        # Build context with friendly anchors
-        context_items = []
-        for i, d in enumerate(results, start=1):
-            snippet = d.page_content.strip()
-            if len(snippet) > 1200:
-                snippet = snippet[:1200] + " ..."
-            src = d.metadata.get("source", "uploaded_doc")
-            context_items.append(f"[{i}](#source-{i}) Source: {src}\n{snippet}")
-
-        context_block = "\n\n".join(context_items)
-        messages = [
-            {"role": "system", "content": QNA_SYSTEM},
-            {"role": "user", "content": f"Context:\n{context_block}\n\nQuestion: {original_query}"}
-        ]
-
-        try:
-            assistant_text = call_groq_chat(messages, temperature=0.0, max_tokens=512)
-            st.session_state.chat_history.append({"role": "assistant", "content": assistant_text})
-        except Exception as e:
-            st.error(f"LLM error: {e}")
-
-# -------------------------
-# Render chat (customer friendly with SVG assistant icon)
-# -------------------------
-for msg in st.session_state.chat_history:
-    if msg["role"] == "user":
-        st.markdown(f"<div class='chat-user'><div class='icon-left'>🧑‍🎓</div><div><strong>You:</strong> {msg['content']}</div></div>", unsafe_allow_html=True)
-    else:
-        st.markdown(f"<div class='chat-assistant'><div class='icon-left'>{ASSISTANT_SVG}</div><div><strong>StudyMate:</strong></div></div>", unsafe_allow_html=True)
-        # quiz rendering with nicer cards
-        if msg.get("meta", {}).get("type") == "quiz":
-            raw = msg["content"]
-            qs = re.findall(r"(Q\d+\..*?)(?=(?:Q\d+\.|$))", raw, flags=re.S)
-            if not qs:
-                st.markdown(raw, unsafe_allow_html=False)
-            else:
-                for q_i, qblock in enumerate(qs, start=1):
-                    header_match = re.match(r"Q\d+\.\s*(.*?)\n", qblock)
-                    qtext = header_match.group(1).strip() if header_match else qblock.strip().split("\n")[0]
-                    opts = re.findall(r"^([A-D])\.\s*(.*)$", qblock, flags=re.M)
-                    ans_match = re.search(r"Answer:\s*([A-D])", qblock)
-                    correct = ans_match.group(1).strip() if ans_match else None
-
-                    st.markdown("<div class='quiz-card'>", unsafe_allow_html=True)
-                    st.markdown(f"<span class='question-badge'>Q{q_i}</span> **{qtext}**", unsafe_allow_html=True)
-                    if opts:
-                        for label, text in opts:
-                            if label == correct:
-                                st.markdown(f"- **{label}. {text}**  <span class='correct'>✅</span>", unsafe_allow_html=True)
-                            else:
-                                st.markdown(f"- {label}. {text}", unsafe_allow_html=True)
-                    else:
-                        st.markdown(qblock, unsafe_allow_html=False)
-                    st.markdown("</div>", unsafe_allow_html=True)
+        with st.spinner("Retrieving relevant passages..."):
+            hits = retrieve(original, k=top_k, rerank_flag=rerank_enabled)
+        if not hits:
+            st.session_state.chat_history.append({"role": "assistant", "content": "I could not find the answer in the provided material."})
         else:
-            st.markdown(msg["content"], unsafe_allow_html=False)
+            # build context with numbered citations
+            context_items = []
+            for i, h in enumerate(hits, start=1):
+                src = h["metadata"].get("source", "uploaded_doc")
+                snippet = h["text"][:900] + (" ..." if len(h["text"])>900 else "")
+                context_items.append(f"[{i}] Source: {src}\n{snippet}")
+            context_block = "\n\n".join(context_items)
+            messages = [{"role":"system","content":QNA_SYSTEM}, {"role":"user","content":f"Context:\n{context_block}\n\nQuestion: {original}"}]
+            try:
+                answer = call_groq_chat(messages, temperature=0.0, max_tokens=512)
+            except Exception as e:
+                answer = "LLM error: " + str(e)
+            st.session_state.chat_history.append({"role":"assistant","content":answer, "meta": {"hits": hits}})
 
 # -------------------------
-# Sources expander with anchors
+# Render chat (bubbles, smart actions, pinned sources)
 # -------------------------
-if st.session_state.last_sources:
-    with st.expander("View Sources used (click a citation to jump)"):
-        for idx, doc in enumerate(st.session_state.last_sources, start=1):
-            st.markdown(f"<a name='source-{idx}'></a>", unsafe_allow_html=True)
-            src = doc.metadata.get("source", "uploaded_doc")
-            snippet = doc.page_content[:1000].replace("\n", " ")
-            st.markdown(f"**[{idx}] {src}**")
-            st.write(snippet)
+for idx, msg in enumerate(st.session_state.chat_history):
+    if msg["role"] == "user":
+        st.markdown(f"<div class='chat-row chat-user'><div class='bubble user'><strong>👤 You:</strong> {st.escape(msg['content'])}</div></div>", unsafe_allow_html=True)
+    else:
+        # assistant header with SVG
+        st.markdown(f"<div class='chat-row'><div class='icon-left'>{ASSISTANT_SVG}</div><div class='bubble assistant'><strong>🤖 StudyMate:</strong></div></div>", unsafe_allow_html=True)
+        # content below
+        content = msg["content"]
+        st.markdown(f"<div style='margin-left:46px;margin-bottom:6px'>{content}</div>", unsafe_allow_html=True)
 
-st.markdown("</div>", unsafe_allow_html=True)
+        # smart actions (Summarize this answer / Quiz from this answer / Find more context)
+        action_cols = st.columns([0.2,0.2,0.2,0.4])
+        with action_cols[0]:
+            if st.button("Summarize this answer", key=f"summarize_snip_{idx}"):
+                # run summarization on assistant content
+                messages = [{"role":"system","content":SUMMARY_SYSTEM}, {"role":"user","content":f"Context:\n{content}"}]
+                try:
+                    out = call_groq_chat(messages, temperature=0.25, max_tokens=400)
+                except Exception as e:
+                    out = "Summarize failed: " + str(e)
+                st.session_state.chat_history.append({"role":"assistant","content":out,"meta":{"type":"summary_from_answer"}})
+                st.experimental_rerun()
+        with action_cols[1]:
+            if st.button("Generate quiz from this", key=f"quiz_snip_{idx}"):
+                messages = [{"role":"system","content":QUIZ_SYSTEM}, {"role":"user","content":f"Context:\n{content}"}]
+                try:
+                    out = call_groq_chat(messages, temperature=0.5, max_tokens=600)
+                except Exception as e:
+                    out = "Quiz failed: " + str(e)
+                st.session_state.chat_history.append({"role":"assistant","content":out,"meta":{"type":"quiz_from_answer"}})
+                st.experimental_rerun()
+        with action_cols[2]:
+            if st.button("Find more context", key=f"morectx_{idx}"):
+                # retrieve by taking top phrases/keywords from answer (simple: take short keywords)
+                # We'll just perform retrieval with the whole assistant answer
+                hits = retrieve(content, k=top_k, rerank_flag=rerank_enabled)
+                st.session_state.chat_history.append({"role":"assistant","content":"I found these related sources.", "meta":{"hits":hits}})
+                st.experimental_rerun()
+
+# -------------------------
+# Show pinned sources (if any)
+# -------------------------
+if st.session_state.pinned_sources:
+    st.markdown("<div class='pinned'><strong>Pinned sources</strong></div>", unsafe_allow_html=True)
+    for p in st.session_state.pinned_sources:
+        st.markdown(f"**{p.get('source')} (page {p.get('page', '?')})**")
+        st.write(p.get("text","")[:400] + "...")
+
+# -------------------------
+# Show last retrieval (sources) with pin option
+# -------------------------
+if st.session_state.last_retrieved:
+    with st.expander("View Sources used (click pin to keep)"):
+        for i, h in enumerate(st.session_state.last_retrieved, start=1):
+            meta = h["metadata"]
+            src = meta.get("source", "uploaded_doc")
+            cols = st.columns([0.8, 0.08, 0.12])
+            with cols[0]:
+                st.markdown(f"**[{i}] {src}**")
+                st.write(h["text"][:800] + (" ..." if len(h["text"])>800 else ""))
+            with cols[1]:
+                if st.button("📌", key=f"pin_{i}"):
+                    st.session_state.pinned_sources.append({"source":src, "page":meta.get("page"), "text":h["text"]})
+            with cols[2]:
+                st.markdown(f"<div style='font-size:12px;color:#666'>score: {h.get('score',0):.3f}</div>", unsafe_allow_html=True)
+
+# -------------------------
+# Render quiz blocks inside chat (parse and beautify)
+# -------------------------
+# we render at the end to keep structure stable
+for msg in st.session_state.chat_history:
+    if msg.get("meta",{}).get("type") == "quiz" or "quiz" in (msg.get("meta") or {}):
+        # parse MCQ blocks Q1.. format
+        raw = msg["content"]
+        qs = re.findall(r"(Q\d+\..*?)(?=(?:Q\d+\.|$))", raw, flags=re.S)
+        if qs:
+            for q_i, qblock in enumerate(qs, start=1):
+                header_match = re.match(r"Q\d+\.\s*(.*?)\n", qblock)
+                qtext = header_match.group(1).strip() if header_match else qblock.strip().split("\n")[0]
+                opts = re.findall(r"^([A-D])\.\s*(.*)$", qblock, flags=re.M)
+                ans_match = re.search(r"Answer:\s*([A-D])", qblock)
+                correct = ans_match.group(1).strip() if ans_match else None
+                st.markdown("<div class='quiz-card'>", unsafe_allow_html=True)
+                st.markdown(f"**Q{q_i}. {qtext}**", unsafe_allow_html=True)
+                if opts:
+                    for label, text in opts:
+                        if label == correct:
+                            st.markdown(f"- **{label}. {text}** ✅", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"- {label}. {text}", unsafe_allow_html=True)
+                else:
+                    st.markdown(qblock, unsafe_allow_html=False)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+# end of app
 
 
