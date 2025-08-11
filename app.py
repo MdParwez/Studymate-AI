@@ -1,11 +1,5 @@
 # app.py
-"""
-StudyMate AI — Final customer-ready RAG app (single file)
-- Keep original behavior/prompts
-- Improve speed: parallel page extraction (per-file), batched embeddings
-- If chroma direct client available, add embeddings with collection.add(...) for speed
-- Polished assistant SVG icon and nicer summary/quiz cards
-"""
+
 
 import os
 import math
@@ -19,8 +13,8 @@ import streamlit as st
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 
-# Try modern LangChain package names (to address deprecation warnings).
-# If not installed, fall back to community wrappers.
+
+
 try:
     # recommended packages
     from langchain_huggingface import HuggingFaceEmbeddings as LCHF_Embeddings
@@ -34,15 +28,15 @@ except Exception:
     EMBEDDINGS_BACKEND = "langchain_community"
     _USE_NEW_LANGCHAIN = False
 
-# Use whichever Chroma class is available
+
 ChromaClass = LC_Chroma if _USE_NEW_LANGCHAIN else LCC_Chroma
 EmbeddingsClass = LCHF_Embeddings if _USE_NEW_LANGCHAIN else LCH_Embeddings
 
-# LangChain text splitter & schema (same API)
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-# Groq SDK for Gemma usage
+# Groq 
 from groq import Groq
 
 # Cross-encoder lazy import placeholder
@@ -66,14 +60,20 @@ if not GROQ_API_KEY:
 GEMMA_MODEL = "gemma2-9b-it"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # fast and compact
 CHUNK_SIZE = 800
-CHUNK_OVERLAP = 50   # as you wanted to keep
+CHUNK_OVERLAP = 50   # as you wanted to keepstre
 TOP_K = 8            # retrieval size (internal)
 EMBED_BATCH_SIZE = 64  # embed batch size
 
-# UI images (replace if you want)
-BANNER_URL = "https://images.unsplash.com/photo-1507842217343-583bb7270b66?q=80&w=1400&auto=format&fit=crop"
+# UI images (stable permanent URLs)
+
+# Banner (Unsplash – stable ixlib link)
+BANNER_URL = "https://images.unsplash.com/photo-1507842217343-583bb7270b66?ixlib=rb-4.0.3&auto=format&fit=crop&w=1400&q=80"
+
+# Sidebar book icon (Flaticon stable link)
 SIDEBAR_BOOK_ICON = "https://cdn-icons-png.flaticon.com/512/29/29302.png"
-SIDEBAR_LIBRARY_IMG = "https://images.unsplash.com/photo-1524995997946-a1c2e315a42f?q=80&w=800&auto=format&fit=crop"
+
+# Sidebar library image (Unsplash – stable ixlib link)
+SIDEBAR_LIBRARY_IMG = "https://images.unsplash.com/photo-1524995997946-a1c2e315a42f?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
 
 # -------------------------
 # Styling and SVGs
@@ -104,6 +104,9 @@ st.markdown(
     .correct {{ color: green; font-weight:700; }}
     .summary-card {{ border-left:6px solid var(--primary); padding:12px; border-radius:8px; background:#fff; box-shadow:0 2px 6px rgba(0,0,0,0.03); margin-bottom:12px; }}
     .small-muted {{ color:#666; font-size:13px; }}
+    .recent-file-btn {{ text-align: left; width: 100%; padding:6px 8px; border-radius:6px; border: none; background: transparent; }}
+    .recent-file-btn:hover {{ background: rgba(168,85,247,0.06); }}
+    .active-file {{ font-weight:700; color: var(--primary); }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -257,25 +260,76 @@ if "chat_history" not in st.session_state:
 if "last_sources" not in st.session_state:
     st.session_state.last_sources = []
 
+# NEW: recent_files session-state store (keeps last 5 uploaded/indexed files with timestamp)
+if "recent_files" not in st.session_state:
+    st.session_state.recent_files = []  # list of dicts: {"filename": str, "timestamp": "YYYY-MM-DD HH:MM"}
+
+# NEW: per-file chat histories store (clickable recent files will load these)
+# Structure: { "filename.pdf": [ {"role":"user"/"assistant", "content": "...", "timestamp":"..."}, ... ] }
+if "chat_histories" not in st.session_state:
+    st.session_state.chat_histories = {}
+
+# NEW: which file's history is currently active / loaded into chat_history
+if "active_file" not in st.session_state:
+    st.session_state.active_file = None
+
 # -------------------------
-# Sidebar UI (unchanged)
+# Sidebar UI (REORDERED: upload -> summary -> quiz -> recent files -> new conversation)
 # -------------------------
 with st.sidebar:
     st.image(SIDEBAR_BOOK_ICON, width=80)
-    st.image(SIDEBAR_LIBRARY_IMG, use_container_width=True)
     st.markdown(f"<h2 style='color:{PRIMARY};margin:6px 0 4px 0'>StudyMate AI</h2>", unsafe_allow_html=True)
     st.markdown("<div style='color:#444;margin-bottom:8px;'>Upload PDFs/TXT — ask questions, summarize chapters, and generate quizzes.</div>", unsafe_allow_html=True)
 
+    # 1) Upload files (unchanged)
     uploaded_files = st.file_uploader("Upload files (PDF / TXT)", type=["pdf", "txt"], accept_multiple_files=True)
 
+    # 2) Summarize button (moved before quiz per your requested order)
     st.markdown("---")
     if st.button("📝 Summarize Uploaded Docs"):
         st.session_state._run_summarize = True
+
+    # 3) Quiz button (kept exact structure, styling, and color)
     if st.button("🎯 Generate Quiz (5 Qs)"):
         st.session_state._run_quiz = True
 
+    # 4) Recent Files (filename + timestamp only) — right after quiz; clickable buttons to load per-file chat
+    st.markdown("---")
+    st.markdown("### 📜 Recent Files (click to load history)")
+    if st.session_state.get("recent_files"):
+        # most recent first
+        for idx, entry in enumerate(st.session_state.recent_files[:5]):
+            fname = entry.get("filename", "unknown.pdf")
+            ts = entry.get("timestamp", "")
+            # Make button label compact
+            label = f"{fname}  ({ts})"
+            btn_key = f"recent_file_btn_{idx}_{fname}"
+            # visually indicate active file
+            if fname == st.session_state.active_file:
+                display_label = f"**{fname}**  <span class='active-file'>({ts})</span>"
+                # a button will still be used so clicks can re-load
+                if st.button(display_label, key=btn_key, help="Click to load this file's chat history"):
+                    st.session_state.active_file = fname
+                    if fname not in st.session_state.chat_histories:
+                        st.session_state.chat_histories[fname] = []
+                    st.session_state.chat_history = list(st.session_state.chat_histories.get(fname, []))
+                    st.session_state.last_sources = []
+                    st.rerun()
+            else:
+                if st.button(label, key=btn_key):
+                    st.session_state.active_file = fname
+                    if fname not in st.session_state.chat_histories:
+                        st.session_state.chat_histories[fname] = []
+                    st.session_state.chat_history = list(st.session_state.chat_histories.get(fname, []))
+                    st.session_state.last_sources = []
+                    st.rerun()
+    else:
+        st.markdown("<div class='small-muted'>No recent files.</div>", unsafe_allow_html=True)
+
+    # 5) New Conversation button
     st.markdown("---")
     if st.button("➕ New Conversation"):
+        # Do not clear per-file chat_histories; only clear the active session chat and last sources
         st.session_state.chat_history = []
         st.session_state.last_sources = []
         st.success("Starting a new conversation — ready when you are.")
@@ -288,7 +342,7 @@ st.markdown(
     f"""
     <div class="header-card">
         <div style="flex-shrink:0;">
-            <img src="{BANNER_URL}" width="240" style="border-radius:8px;">
+            <img src="" width="240" style="border-radius:8px;">
         </div>
         <div>
             <h1 style="color:white;margin:0;">StudyMate AI</h1>
@@ -299,6 +353,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown("")  # spacing
+
+# Show currently active file in main area (non-intrusive)
+if st.session_state.active_file:
+    st.markdown(f"**Active file:** {st.session_state.active_file}", unsafe_allow_html=True)
 
 # -------------------------
 # Handle uploads: chunk + embed + add; sequential file processing with per-file progress
@@ -436,6 +494,21 @@ if uploaded_files:
         status.success(f"Indexed '{uploaded.name}' ✅")
         added_any = True
 
+        # Add to recent_files list (keep as most recent first, limit 5)
+        try:
+            entry = {"filename": uploaded.name, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+            # remove existing duplicate if present
+            st.session_state.recent_files = [e for e in st.session_state.recent_files if e.get("filename") != uploaded.name]
+            # insert at front
+            st.session_state.recent_files.insert(0, entry)
+            # trim to 5
+            st.session_state.recent_files = st.session_state.recent_files[:5]
+            # ensure per-file chat_histories exists
+            if uploaded.name not in st.session_state.chat_histories:
+                st.session_state.chat_histories[uploaded.name] = []
+        except Exception:
+            pass
+
         # per user's request: clear current chat & last_sources on new upload to start fresh
         st.session_state.chat_history = []
         st.session_state.last_sources = []
@@ -548,7 +621,11 @@ if st.session_state.pop("_run_summarize", False):
         st.markdown("<div class='summary-card'>", unsafe_allow_html=True)
         st.markdown(final_summary, unsafe_allow_html=False)
         st.markdown("</div>", unsafe_allow_html=True)
-        st.session_state.chat_history.append({"role": "assistant", "content": final_summary})
+        # append to both visible chat history and per-file history if active_file present
+        msg_entry = {"role": "assistant", "content": final_summary, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        st.session_state.chat_history.append(msg_entry)
+        if st.session_state.active_file:
+            st.session_state.chat_histories.setdefault(st.session_state.active_file, []).append(msg_entry)
 
 if st.session_state.pop("_run_quiz", False):
     if not st.session_state.all_docs:
@@ -561,20 +638,29 @@ if st.session_state.pop("_run_quiz", False):
         try:
             raw_quiz = call_groq_chat(messages, temperature=0.5, max_tokens=700)
             # store and render nicely
-            st.session_state.chat_history.append({"role": "assistant", "content": raw_quiz, "meta": {"type": "quiz"}})
+            msg_entry = {"role": "assistant", "content": raw_quiz, "meta": {"type": "quiz"}, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+            st.session_state.chat_history.append(msg_entry)
+            st.session_state.chat_histories.setdefault(st.session_state.active_file or "unassigned", []).append(msg_entry)
         except Exception as e:
             st.error(f"Quiz generation failed: {e}")
 
 # -------------------------
-# Chat input (unchanged)
+# Chat input (unchanged but augmented to save per-file history)
 # -------------------------
 user_input = st.chat_input("Ask anything about your uploaded documents...")
 if user_input:
     original_query = user_input.strip()
     retrieval_query = rewrite_short_query_for_retrieval(original_query)
 
-    st.session_state.chat_history.append({"role": "user", "content": original_query})
+    # build user message entry with timestamp
+    user_msg_entry = {"role": "user", "content": original_query, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    # append to visible chat history
+    st.session_state.chat_history.append(user_msg_entry)
+    # also append to per-file history if active file is set; else store under "unassigned"
+    target_file = st.session_state.active_file or "unassigned"
+    st.session_state.chat_histories.setdefault(target_file, []).append(user_msg_entry)
 
+    # keep original behavior
     if not st.session_state.all_docs:
         st.warning("No documents uploaded. Please upload PDFs/TXT on the left.")
     else:
@@ -598,7 +684,10 @@ if user_input:
 
         try:
             assistant_text = call_groq_chat(messages, temperature=0.0, max_tokens=512)
-            st.session_state.chat_history.append({"role": "assistant", "content": assistant_text})
+            assistant_msg_entry = {"role": "assistant", "content": assistant_text, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+            st.session_state.chat_history.append(assistant_msg_entry)
+            # save to per-file history as well
+            st.session_state.chat_histories.setdefault(target_file, []).append(assistant_msg_entry)
         except Exception as e:
             st.error(f"LLM error: {e}")
 
@@ -651,5 +740,7 @@ if st.session_state.last_sources:
             st.write(snippet)
 
 st.markdown("</div>", unsafe_allow_html=True)
+
+
 
 
