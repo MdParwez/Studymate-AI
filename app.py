@@ -1,11 +1,9 @@
 # app.py
-
-
 import os
 import math
 import re
 import uuid
-from typing import List
+from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,10 +11,12 @@ import streamlit as st
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 
-
+# LangChain memory container (we'll use it as a convenience wrapper)
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import HumanMessage, AIMessage
 
 try:
-    # recommended packages
+    # recommended packages (new langchain wrappers)
     from langchain_huggingface import HuggingFaceEmbeddings as LCHF_Embeddings
     from langchain_chroma import Chroma as LC_Chroma
     EMBEDDINGS_BACKEND = "langchain_huggingface"
@@ -28,15 +28,13 @@ except Exception:
     EMBEDDINGS_BACKEND = "langchain_community"
     _USE_NEW_LANGCHAIN = False
 
-
 ChromaClass = LC_Chroma if _USE_NEW_LANGCHAIN else LCC_Chroma
 EmbeddingsClass = LCHF_Embeddings if _USE_NEW_LANGCHAIN else LCH_Embeddings
-
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-# Groq 
+# Groq client for LLM calls
 from groq import Groq
 
 # Cross-encoder lazy import placeholder
@@ -60,24 +58,16 @@ if not GROQ_API_KEY:
 GEMMA_MODEL = "gemma2-9b-it"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # fast and compact
 CHUNK_SIZE = 800
-CHUNK_OVERLAP = 50   # as you wanted to keepstre
-TOP_K = 8            # retrieval size (internal)
-EMBED_BATCH_SIZE = 64  # embed batch size
+CHUNK_OVERLAP = 50
+TOP_K = 8
+EMBED_BATCH_SIZE = 64
 
 # UI images (stable permanent URLs)
-
-# Banner (Unsplash – stable ixlib link)
 BANNER_URL = "https://images.unsplash.com/photo-1507842217343-583bb7270b66?ixlib=rb-4.0.3&auto=format&fit=crop&w=1400&q=80"
-
-# Sidebar book icon (Flaticon stable link)
 SIDEBAR_BOOK_ICON = "https://cdn-icons-png.flaticon.com/512/29/29302.png"
-
-# Sidebar library image (Unsplash – stable ixlib link)
 SIDEBAR_LIBRARY_IMG = "https://images.unsplash.com/photo-1524995997946-a1c2e315a42f?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
 
-# -------------------------
 # Styling and SVGs
-# -------------------------
 ASSISTANT_SVG = """
 <img src="data:image/svg+xml;utf8,
 <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' width='22' height='22'>
@@ -105,15 +95,15 @@ st.markdown(
     .summary-card {{ border-left:6px solid var(--primary); padding:12px; border-radius:8px; background:#fff; box-shadow:0 2px 6px rgba(0,0,0,0.03); margin-bottom:12px; }}
     .small-muted {{ color:#666; font-size:13px; }}
     .recent-file-btn {{ text-align: left; width: 100%; padding:6px 8px; border-radius:6px; border: none; background: transparent; }}
-    .recent-file-btn:hover {{ background: rgba(168,85,247,0.06); }}
-    .active-file {{ font-weight:700; color: var(--primary); }}
+    .recent-chat-btn {{ text-align: left; width: 100%; padding:6px 8px; border-radius:6px; border: none; background: transparent; }}
+    .recent-chat-active {{ font-weight:700; color: var(--primary); }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # -------------------------
-# Prompts (unchanged)
+# Prompts 
 # -------------------------
 QNA_SYSTEM = """
 You are StudyMate, a friendly and accurate study assistant. Use ONLY the provided context passages.
@@ -165,15 +155,10 @@ def extract_page_text(page):
         return ""
 
 def extract_text_from_pdf_parallel(file_bytes: bytes, max_workers: int = 6) -> str:
-    """
-    Extract text from PDF pages in parallel (per-file).
-    Returns concatenated text.
-    """
     text = ""
     with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
-        pages = list(pdf)  # list of page objects
+        pages = list(pdf)
         results = [None] * len(pages)
-        # Use ThreadPoolExecutor to extract page text in parallel
         with ThreadPoolExecutor(max_workers=min(max_workers, len(pages))) as ex:
             futures = {ex.submit(extract_page_text, p): idx for idx, p in enumerate(pages)}
             for fut in as_completed(futures):
@@ -182,7 +167,6 @@ def extract_text_from_pdf_parallel(file_bytes: bytes, max_workers: int = 6) -> s
                     results[idx] = fut.result()
                 except Exception:
                     results[idx] = ""
-        # join in page order
         text = "\n\n".join(results)
     return text
 
@@ -201,7 +185,6 @@ def rewrite_short_query_for_retrieval(query: str) -> str:
         return f"What do the provided documents say about {query.strip()}?"
     return query
 
-# Cross-encoder (lazy) - reranking enabled by default internally
 def lazy_load_crossencoder():
     global _crossencoder
     if _crossencoder is None:
@@ -222,7 +205,7 @@ def rerank_with_crossencoder(query: str, docs: List[Document]) -> List[Document]
     return [d for d, _ in scored]
 
 # -------------------------
-# Session state initialization (unchanged)
+# Session state initialization
 # -------------------------
 if "embeddings" not in st.session_state:
     try:
@@ -231,7 +214,6 @@ if "embeddings" not in st.session_state:
         try:
             st.session_state.embeddings = EmbeddingsClass()
         except Exception:
-            # fallback to sentence-transformers model for batch encode
             st.session_state._sbert = SentenceTransformer(EMBEDDING_MODEL_NAME)
             st.session_state.embeddings = None
 
@@ -240,7 +222,6 @@ if "chroma_db" not in st.session_state:
         st.session_state.chroma_db = ChromaClass(embedding_function=st.session_state.embeddings, persist_directory=None)
         st.session_state._chroma_direct = False
     except Exception:
-        # fallback to chromadb direct client
         import chromadb
         from chromadb.config import Settings
         client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet"))
@@ -251,6 +232,7 @@ if "chroma_db" not in st.session_state:
         st.session_state.chroma_db = collection
         st.session_state._chroma_direct = True
 
+# Document/indexing state
 if "indexed_files" not in st.session_state:
     st.session_state.indexed_files = set()
 if "all_docs" not in st.session_state:
@@ -260,82 +242,168 @@ if "chat_history" not in st.session_state:
 if "last_sources" not in st.session_state:
     st.session_state.last_sources = []
 
-# NEW: recent_files session-state store (keeps last 5 uploaded/indexed files with timestamp)
+# Recent files & per-file histories (existing)
 if "recent_files" not in st.session_state:
-    st.session_state.recent_files = []  # list of dicts: {"filename": str, "timestamp": "YYYY-MM-DD HH:MM"}
-
-# NEW: per-file chat histories store (clickable recent files will load these)
-# Structure: { "filename.pdf": [ {"role":"user"/"assistant", "content": "...", "timestamp":"..."}, ... ] }
+    st.session_state.recent_files = []
 if "chat_histories" not in st.session_state:
     st.session_state.chat_histories = {}
-
-# NEW: which file's history is currently active / loaded into chat_history
 if "active_file" not in st.session_state:
     st.session_state.active_file = None
 
 # -------------------------
-# Sidebar UI (REORDERED: upload -> summary -> quiz -> recent files -> new conversation)
+# New: Conversation memory, recent chats & interactive quiz
+# -------------------------
+# Conversation memory (LangChain wrapper used only to manage message objects)
+if "memory" not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+# recent chat session names (max 5) and chat logs mapping
+if "recent_chats" not in st.session_state:
+    st.session_state.recent_chats = []  # list of chat names, newest first
+if "chat_logs" not in st.session_state:
+    st.session_state.chat_logs = {}  # chat_name -> [ {role, content, timestamp} ]
+
+# identifier for the currently active chat session (not file)
+if "current_chat" not in st.session_state:
+    st.session_state.current_chat = None
+
+# interactive quiz storage
+if "quiz_questions" not in st.session_state:
+    st.session_state.quiz_questions = []  # list of {q, options, answer, raw}
+if "quiz_answers" not in st.session_state:
+    st.session_state.quiz_answers = {}  # keys quiz_{i} -> selected
+
+# Helper: create a new chat session name and initialize structures
+def start_new_chat_session(name: Optional[str] = None) -> str:
+    if not name:
+        name = f"Chat {datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # push to recent_chats front
+    st.session_state.recent_chats = [c for c in st.session_state.recent_chats if c != name]
+    st.session_state.recent_chats.insert(0, name)
+    st.session_state.recent_chats = st.session_state.recent_chats[:5]  # keep last 5
+    st.session_state.chat_logs.setdefault(name, [])
+    st.session_state.current_chat = name
+    # clear memory and optionally reload with logs if any (fresh session begins empty)
+    st.session_state.memory.clear()
+    return name
+
+# Helper: append message to current chat (and memory)
+def append_message_to_current_chat(role: str, content: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    chat_name = st.session_state.current_chat or start_new_chat_session()
+    st.session_state.chat_logs.setdefault(chat_name, []).append({"role": role, "content": content, "timestamp": ts})
+    # Also keep a lightweight visible chat_history (render order)
+    st.session_state.chat_history.append({"role": role, "content": content, "timestamp": ts})
+    # add to LangChain memory wrapper (so we can later inject)
+    try:
+        if role.lower() == "user":
+            st.session_state.memory.chat_memory.add_user_message(content)
+        else:
+            st.session_state.memory.chat_memory.add_ai_message(content)
+    except Exception:
+        # Fallback: memory wrapper may not have chat_memory attribute in some versions
+        pass
+
+# -------------------------
+# Sidebar UI
 # -------------------------
 with st.sidebar:
     st.image(SIDEBAR_BOOK_ICON, width=80)
     st.markdown(f"<h2 style='color:{PRIMARY};margin:6px 0 4px 0'>StudyMate AI</h2>", unsafe_allow_html=True)
     st.markdown("<div style='color:#444;margin-bottom:8px;'>Upload PDFs/TXT — ask questions, summarize chapters, and generate quizzes.</div>", unsafe_allow_html=True)
 
-    # 1) Upload files (unchanged)
     uploaded_files = st.file_uploader("Upload files (PDF / TXT)", type=["pdf", "txt"], accept_multiple_files=True)
 
-    # 2) Summarize button (moved before quiz per your requested order)
     st.markdown("---")
     if st.button("📝 Summarize Uploaded Docs"):
         st.session_state._run_summarize = True
 
-    # 3) Quiz button (kept exact structure, styling, and color)
     if st.button("🎯 Generate Quiz (5 Qs)"):
         st.session_state._run_quiz = True
 
-    # 4) Recent Files (filename + timestamp only) — right after quiz; clickable buttons to load per-file chat
     st.markdown("---")
     st.markdown("### 📜 Recent Files (click to load history)")
     if st.session_state.get("recent_files"):
-        # most recent first
         for idx, entry in enumerate(st.session_state.recent_files[:5]):
             fname = entry.get("filename", "unknown.pdf")
             ts = entry.get("timestamp", "")
-            # Make button label compact
             label = f"{fname}  ({ts})"
             btn_key = f"recent_file_btn_{idx}_{fname}"
-            # visually indicate active file
             if fname == st.session_state.active_file:
-                display_label = f"**{fname}**  <span class='active-file'>({ts})</span>"
-                # a button will still be used so clicks can re-load
+                display_label = f"**{fname}**  <span class='recent-chat-active'>({ts})</span>"
                 if st.button(display_label, key=btn_key, help="Click to load this file's chat history"):
                     st.session_state.active_file = fname
-                    if fname not in st.session_state.chat_histories:
-                        st.session_state.chat_histories[fname] = []
+                    st.session_state.chat_histories.setdefault(fname, [])
                     st.session_state.chat_history = list(st.session_state.chat_histories.get(fname, []))
                     st.session_state.last_sources = []
                     st.rerun()
             else:
                 if st.button(label, key=btn_key):
                     st.session_state.active_file = fname
-                    if fname not in st.session_state.chat_histories:
-                        st.session_state.chat_histories[fname] = []
+                    st.session_state.chat_histories.setdefault(fname, [])
                     st.session_state.chat_history = list(st.session_state.chat_histories.get(fname, []))
                     st.session_state.last_sources = []
                     st.rerun()
     else:
         st.markdown("<div class='small-muted'>No recent files.</div>", unsafe_allow_html=True)
 
-    # 5) New Conversation button
+    st.markdown("---")
+    st.markdown("### 💬 Recent Chats")
+    # recent chat list (max 5) - clickable to load chat session into memory and main view
+    if st.session_state.recent_chats:
+        for i, chat_name in enumerate(st.session_state.recent_chats[:5]):
+            btn_key = f"recent_chat_btn_{i}_{chat_name}"
+            display = f"{chat_name}"
+            if chat_name == st.session_state.current_chat:
+                display = f"**{chat_name}** <span class='recent-chat-active'>(active)</span>"
+                if st.button(display, key=btn_key):
+                    # reload (no-op) -> but ensure memory is populated from logs
+                    st.session_state.chat_history = list(st.session_state.chat_logs.get(chat_name, []))
+                    # populate LangChain memory with messages from chat logs
+                    st.session_state.memory.clear()
+                    for msg in st.session_state.chat_logs.get(chat_name, []):
+                        if msg["role"].lower() == "user":
+                            try:
+                                st.session_state.memory.chat_memory.add_user_message(msg["content"])
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                st.session_state.memory.chat_memory.add_ai_message(msg["content"])
+                            except Exception:
+                                pass
+                    st.rerun()
+            else:
+                if st.button(display, key=btn_key):
+                    st.session_state.current_chat = chat_name
+                    # load visible history
+                    st.session_state.chat_history = list(st.session_state.chat_logs.get(chat_name, []))
+                    # populate LangChain memory with messages from chat logs
+                    st.session_state.memory.clear()
+                    for msg in st.session_state.chat_logs.get(chat_name, []):
+                        if msg["role"].lower() == "user":
+                            try:
+                                st.session_state.memory.chat_memory.add_user_message(msg["content"])
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                st.session_state.memory.chat_memory.add_ai_message(msg["content"])
+                            except Exception:
+                                pass
+                    st.rerun()
+    else:
+        st.markdown("<div class='small-muted'>No recent chats.</div>", unsafe_allow_html=True)
+
     st.markdown("---")
     if st.button("➕ New Conversation"):
-        # Do not clear per-file chat_histories; only clear the active session chat and last sources
-        st.session_state.chat_history = []
-        st.session_state.last_sources = []
-        st.success("Starting a new conversation — ready when you are.")
+        # create a new named chat session
+        start_new_chat_session()
+        st.success("Started a new conversation.")
+        st.rerun()
 
 # -------------------------
-# Main header (unchanged)
+# Main header
 # -------------------------
 st.markdown('<div class="main-container">', unsafe_allow_html=True)
 st.markdown(
@@ -352,20 +420,18 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.markdown("")  # spacing
+st.markdown("")
 
-# Show currently active file in main area (non-intrusive)
 if st.session_state.active_file:
     st.markdown(f"**Active file:** {st.session_state.active_file}", unsafe_allow_html=True)
 
 # -------------------------
-# Handle uploads: chunk + embed + add; sequential file processing with per-file progress
+# Handle uploads: chunk + embed + add
 # -------------------------
 if uploaded_files:
     new_docs = []
     added_any = False
 
-    # sequentially process each file (safe on memory)
     for file_idx, uploaded in enumerate(uploaded_files, start=1):
         if uploaded.name in st.session_state.indexed_files:
             st.info(f"File '{uploaded.name}' already indexed in this session — skipping.")
@@ -375,25 +441,20 @@ if uploaded_files:
         file_size_mb = len(file_bytes) / (1024 * 1024)
         status = st.info(f"Processing file {file_idx}/{len(uploaded_files)}: {uploaded.name} ({file_size_mb:.2f} MB)")
 
-        # 1) extract pages in parallel
         with st.spinner("Extracting text (parallel per-page)..."):
             try:
                 text = extract_text_from_pdf_parallel(file_bytes, max_workers=6)
             except Exception:
-                # fallback to serial extraction if parallel fails
                 text = ""
                 with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
                     for page in pdf:
                         text += page.get_text() + "\n\n"
 
-        # 2) chunk
         splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         chunks = splitter.split_text(text)
         total_chunks = len(chunks)
         status.info(f"Processing file {file_idx}/{len(uploaded_files)}: {uploaded.name} — {total_chunks} chunks")
 
-        # 3) embed chunks in batches (using sentence-transformers encode for speed)
-        # prefer st.session_state._sbert if available or embeddings wrapper if it exposes batch encode
         batch_size = EMBED_BATCH_SIZE
         embeddings_list = []
         ids = []
@@ -404,10 +465,8 @@ if uploaded_files:
         for start in range(0, total_chunks, batch_size):
             end = min(start + batch_size, total_chunks)
             batch_chunks = chunks[start:end]
-            # compute embeddings using underlying sbert model if available
             if hasattr(st.session_state, "_sbert"):
                 embs = st.session_state._sbert.encode(batch_chunks, show_progress_bar=False, convert_to_numpy=True)
-                # embs is numpy array; convert to list
                 for i, chunk_text in enumerate(batch_chunks):
                     uid = str(uuid.uuid4())
                     ids.append(uid)
@@ -415,10 +474,8 @@ if uploaded_files:
                     metadatas.append({"source": uploaded.name, "chunk_index": start + i})
                     embeddings_list.append(embs[i].tolist())
             else:
-                # try using embeddings wrapper if it has embed_documents or embed_texts
                 if st.session_state.embeddings is not None:
                     try:
-                        # Some wrappers provide embed_documents
                         embs = st.session_state.embeddings.embed_documents(batch_chunks)
                         for i, chunk_text in enumerate(batch_chunks):
                             uid = str(uuid.uuid4())
@@ -427,7 +484,6 @@ if uploaded_files:
                             metadatas.append({"source": uploaded.name, "chunk_index": start + i})
                             embeddings_list.append(embs[i])
                     except Exception:
-                        # last resort: no embeddings available, just add documents (will be embedded by Chroma)
                         for i, chunk_text in enumerate(batch_chunks):
                             uid = str(uuid.uuid4())
                             ids.append(uid)
@@ -435,7 +491,6 @@ if uploaded_files:
                             metadatas.append({"source": uploaded.name, "chunk_index": start + i})
                             embeddings_list.append(None)
                 else:
-                    # no embeddings available
                     for i, chunk_text in enumerate(batch_chunks):
                         uid = str(uuid.uuid4())
                         ids.append(uid)
@@ -447,11 +502,8 @@ if uploaded_files:
 
         progress.empty()
 
-        # 4) add to vector DB:
-        # if direct chroma client collection is used (_chroma_direct True), we can pass precomputed embeddings
         try:
             if getattr(st.session_state, "_chroma_direct", False):
-                # remove None embeddings if any (chroma requires numeric vectors)
                 valid_ids, valid_docs, valid_metas, valid_embs = [], [], [], []
                 for i, emb in enumerate(embeddings_list):
                     if emb is not None:
@@ -467,49 +519,36 @@ if uploaded_files:
                         embeddings=valid_embs
                     )
                 else:
-                    # fallback to add documents only (let chroma compute embeddings)
                     st.session_state.chroma_db.add(documents=documents_texts, metadatas=metadatas, ids=ids)
             else:
-                # use add_documents fallback (signature may compute embeddings internally)
                 docs_to_add = [Document(page_content=t, metadata=m) for t, m in zip(documents_texts, metadatas)]
                 try:
                     st.session_state.chroma_db.add_documents(docs_to_add)
                 except Exception:
-                    # try alternate signature
                     try:
                         st.session_state.chroma_db.add_documents(docs_to_add, embedding=st.session_state.embeddings)
                     except Exception:
-                        # as last resort, ignore some add errors but append to all_docs so retrieval may still work for some backends
                         pass
         except Exception:
-            # swallow DB insertion errors but continue
             pass
 
-        # append to session-level all_docs for future summarization logic
         for t, m in zip(documents_texts, metadatas):
             st.session_state.all_docs.append(Document(page_content=t, metadata=m))
 
-        # mark indexed & UI
         st.session_state.indexed_files.add(uploaded.name)
         status.success(f"Indexed '{uploaded.name}' ✅")
         added_any = True
 
-        # Add to recent_files list (keep as most recent first, limit 5)
         try:
             entry = {"filename": uploaded.name, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
-            # remove existing duplicate if present
             st.session_state.recent_files = [e for e in st.session_state.recent_files if e.get("filename") != uploaded.name]
-            # insert at front
             st.session_state.recent_files.insert(0, entry)
-            # trim to 5
             st.session_state.recent_files = st.session_state.recent_files[:5]
-            # ensure per-file chat_histories exists
             if uploaded.name not in st.session_state.chat_histories:
                 st.session_state.chat_histories[uploaded.name] = []
         except Exception:
             pass
 
-        # per user's request: clear current chat & last_sources on new upload to start fresh
         st.session_state.chat_history = []
         st.session_state.last_sources = []
 
@@ -519,13 +558,11 @@ if uploaded_files:
 st.markdown("---")
 
 # -------------------------
-# Retrieval function (unchanged)
+# Retrieval function 
 # -------------------------
 def retrieve_for_query(query: str, k: int = TOP_K) -> List[Document]:
-    # If using chromadb direct collection
     if getattr(st.session_state, "_chroma_direct", False):
         try:
-            # compute query embedding with sbert if available
             if hasattr(st.session_state, "_sbert"):
                 q_emb = st.session_state._sbert.encode([query], convert_to_numpy=True)[0].tolist()
                 res = st.session_state.chroma_db.query(query_embeddings=[q_emb], n_results=k, include=["documents","metadatas"])
@@ -545,7 +582,6 @@ def retrieve_for_query(query: str, k: int = TOP_K) -> List[Document]:
         except Exception:
             docs = []
 
-    # internal reranking (lazy)
     try:
         docs = rerank_with_crossencoder(query, docs)
     except Exception:
@@ -555,7 +591,7 @@ def retrieve_for_query(query: str, k: int = TOP_K) -> List[Document]:
     return docs
 
 # -------------------------
-# Summarization helpers (unchanged)
+# Summarization 
 # -------------------------
 SUMMARY_BATCH_CHUNKS = 8
 SUMMARY_BATCH_LIMIT = 40
@@ -608,7 +644,34 @@ def synthesize_final_summary(partials: List[str]) -> str:
     return final
 
 # -------------------------
-# Summarize & Quiz triggers (render changes for nicer cards)
+# Quiz parsing
+# -------------------------
+def parse_quiz_raw(raw: str) -> List[Dict[str, Any]]:
+    """
+    Parse the raw quiz text produced by the model into a list of questions:
+    [{ 'q': str, 'options': [A,B,C,D], 'answer': 'A' }]
+    """
+    questions = []
+    # Find Q blocks
+    qblocks = re.findall(r"(Q\d+\..*?)(?=(?:Q\d+\.|$))", raw, flags=re.S)
+    for qb in qblocks:
+        # extract question header
+        header = re.match(r"Q\d+\.\s*(.*?)\n", qb)
+        qtext = header.group(1).strip() if header else qb.split("\n")[0].strip()
+        opts = re.findall(r"^([A-D])\.\s*(.*)$", qb, flags=re.M)
+        options = []
+        for _, txt in opts:
+            options.append(txt.strip())
+        ans_m = re.search(r"Answer:\s*([A-D])", qb)
+        answer = ans_m.group(1).strip() if ans_m else None
+        # Ensure 4 options if possible (pad with blanks)
+        while len(options) < 4:
+            options.append("—")
+        questions.append({"q": qtext, "options": options[:4], "answer": answer, "raw": qb.strip()})
+    return questions
+
+# -------------------------
+# Summarize & Quiz triggers (with interactive quiz storage)
 # -------------------------
 if st.session_state.pop("_run_summarize", False):
     if not st.session_state.all_docs:
@@ -617,13 +680,12 @@ if st.session_state.pop("_run_summarize", False):
         st.info("Creating a structured summary for your materials...")
         partials = summarize_batches(st.session_state.all_docs, batch_size=SUMMARY_BATCH_CHUNKS)
         final_summary = synthesize_final_summary(partials)
-        # render inside a styled summary card
         st.markdown("<div class='summary-card'>", unsafe_allow_html=True)
         st.markdown(final_summary, unsafe_allow_html=False)
         st.markdown("</div>", unsafe_allow_html=True)
-        # append to both visible chat history and per-file history if active_file present
         msg_entry = {"role": "assistant", "content": final_summary, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
-        st.session_state.chat_history.append(msg_entry)
+        append_message_to_current_chat("assistant", final_summary)
+        # Also attach to per-file history if a file is active
         if st.session_state.active_file:
             st.session_state.chat_histories.setdefault(st.session_state.active_file, []).append(msg_entry)
 
@@ -637,34 +699,34 @@ if st.session_state.pop("_run_quiz", False):
         messages = [{"role": "system", "content": QUIZ_SYSTEM}, {"role": "user", "content": f"Context:\n{context_block}"}]
         try:
             raw_quiz = call_groq_chat(messages, temperature=0.5, max_tokens=700)
-            # store and render nicely
-            msg_entry = {"role": "assistant", "content": raw_quiz, "meta": {"type": "quiz"}, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
-            st.session_state.chat_history.append(msg_entry)
-            st.session_state.chat_histories.setdefault(st.session_state.active_file or "unassigned", []).append(msg_entry)
+            # parse quiz into interactive structure
+            parsed = parse_quiz_raw(raw_quiz)
+            if not parsed:
+                st.error("Quiz generator didn't return questions in expected format.")
+            else:
+                st.session_state.quiz_questions = parsed
+                # store raw quiz in assistant message and append to chat logs
+                msg_entry = {"role": "assistant", "content": raw_quiz, "meta": {"type": "quiz"}, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+                append_message_to_current_chat("assistant", raw_quiz)
+                # Also store per-file if active file
+                st.session_state.chat_histories.setdefault(st.session_state.active_file or "unassigned", []).append(msg_entry)
         except Exception as e:
             st.error(f"Quiz generation failed: {e}")
 
 # -------------------------
-# Chat input (unchanged but augmented to save per-file history)
+# Chat input and handling (integrate memory)
 # -------------------------
 user_input = st.chat_input("Ask anything about your uploaded documents...")
 if user_input:
     original_query = user_input.strip()
-    retrieval_query = rewrite_short_query_for_retrieval(original_query)
+    # Append user message to current chat and LangChain memory
+    append_message_to_current_chat("user", original_query)
 
-    # build user message entry with timestamp
-    user_msg_entry = {"role": "user", "content": original_query, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
-    # append to visible chat history
-    st.session_state.chat_history.append(user_msg_entry)
-    # also append to per-file history if active file is set; else store under "unassigned"
-    target_file = st.session_state.active_file or "unassigned"
-    st.session_state.chat_histories.setdefault(target_file, []).append(user_msg_entry)
-
-    # keep original behavior
     if not st.session_state.all_docs:
         st.warning("No documents uploaded. Please upload PDFs/TXT on the left.")
     else:
         with st.spinner("Looking up your materials..."):
+            retrieval_query = rewrite_short_query_for_retrieval(original_query)
             results = retrieve_for_query(retrieval_query, k=TOP_K)
 
         # Build context with friendly anchors
@@ -677,29 +739,45 @@ if user_input:
             context_items.append(f"[{i}](#source-{i}) Source: {src}\n{snippet}")
 
         context_block = "\n\n".join(context_items)
-        messages = [
-            {"role": "system", "content": QNA_SYSTEM},
-            {"role": "user", "content": f"Context:\n{context_block}\n\nQuestion: {original_query}"}
-        ]
+
+        # Build messages for Groq call: include system, memory messages, context, and user question.
+        messages: List[dict] = [{"role": "system", "content": QNA_SYSTEM}]
+        # Inject memory history if available (as user/assistant roles)
+        try:
+            mem_msgs = st.session_state.memory.chat_memory.messages
+            for m in mem_msgs:
+                if getattr(m, "type", "").lower() in ("human", "user"):
+                    messages.append({"role": "user", "content": m.content})
+                else:
+                    messages.append({"role": "assistant", "content": m.content})
+        except Exception:
+            # fallback: if memory wrapper doesn't expose messages, use stored chat_history visible list
+            for m in st.session_state.chat_history[-20:]:
+                role = m.get("role", "user").lower()
+                r = "user" if role == "user" else "assistant"
+                messages.append({"role": r, "content": m.get("content", "")})
+
+        # add retrieval context and the current question
+        messages.append({"role": "user", "content": f"Context:\n{context_block}\n\nQuestion: {original_query}"})
 
         try:
             assistant_text = call_groq_chat(messages, temperature=0.0, max_tokens=512)
-            assistant_msg_entry = {"role": "assistant", "content": assistant_text, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
-            st.session_state.chat_history.append(assistant_msg_entry)
-            # save to per-file history as well
-            st.session_state.chat_histories.setdefault(target_file, []).append(assistant_msg_entry)
+            append_message_to_current_chat("assistant", assistant_text)
+            # also save per-file history if active_file present
+            target_file = st.session_state.active_file or "unassigned"
+            st.session_state.chat_histories.setdefault(target_file, []).append({"role": "user", "content": original_query, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            st.session_state.chat_histories.setdefault(target_file, []).append({"role": "assistant", "content": assistant_text, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")})
         except Exception as e:
             st.error(f"LLM error: {e}")
 
 # -------------------------
-# Render chat (customer friendly with SVG assistant icon)
+#  chat (friendly)
 # -------------------------
 for msg in st.session_state.chat_history:
-    if msg["role"] == "user":
+    if msg["role"].lower() == "user":
         st.markdown(f"<div class='chat-user'><div class='icon-left'>🧑‍🎓</div><div><strong>You:</strong> {msg['content']}</div></div>", unsafe_allow_html=True)
     else:
         st.markdown(f"<div class='chat-assistant'><div class='icon-left'>{ASSISTANT_SVG}</div><div><strong>StudyMate:</strong></div></div>", unsafe_allow_html=True)
-        # quiz rendering with nicer cards
         if msg.get("meta", {}).get("type") == "quiz":
             raw = msg["content"]
             qs = re.findall(r"(Q\d+\..*?)(?=(?:Q\d+\.|$))", raw, flags=re.S)
@@ -728,6 +806,49 @@ for msg in st.session_state.chat_history:
             st.markdown(msg["content"], unsafe_allow_html=False)
 
 # -------------------------
+# interactive quiz UI (if parsed quiz questions exist)
+# -------------------------
+if st.session_state.quiz_questions:
+    st.markdown("---")
+    st.subheader("📝 Interactive Quiz")
+    with st.form("interactive_quiz_form"):
+        for i, q in enumerate(st.session_state.quiz_questions):
+            key = f"quiz_{i}"
+            # pre-populate previously selected answer if present
+            default = st.session_state.quiz_answers.get(key, None)
+            # use radio with options
+            selected = st.radio(f"Q{i+1}. {q['q']}", q["options"], index=0 if default is None else q["options"].index(default) if default in q["options"] else 0, key=key)
+            st.session_state.quiz_answers[key] = selected
+        submitted = st.form_submit_button("Submit Answers")
+
+    if submitted:
+        score = 0
+        results_ui = []
+        for i, q in enumerate(st.session_state.quiz_questions):
+            key = f"quiz_{i}"
+            selected = st.session_state.quiz_answers.get(key)
+            correct_label = q.get("answer")
+            correct_option_text = None
+            # convert letter to option text if possible
+            if correct_label and correct_label in ("A", "B", "C", "D"):
+                idx = ord(correct_label) - ord("A")
+                if 0 <= idx < len(q["options"]):
+                    correct_option_text = q["options"][idx]
+            # Compare selected with correct text
+            if correct_option_text and selected == correct_option_text:
+                score += 1
+                results_ui.append((q["q"], selected, True, correct_option_text))
+            else:
+                results_ui.append((q["q"], selected, False, correct_option_text))
+        st.success(f"Your score: {score}/{len(st.session_state.quiz_questions)}")
+        for idx, (qtext, chosen, ok, correct_text) in enumerate(results_ui, start=1):
+            status = "✅ Correct" if ok else "❌ Incorrect"
+            st.markdown(f"**Q{idx}. {qtext}** — {status}")
+            st.markdown(f"- Your answer: {chosen}")
+            if not ok:
+                st.markdown(f"- Correct answer: **{correct_text}**")
+
+# -------------------------
 # Sources expander with anchors
 # -------------------------
 if st.session_state.last_sources:
@@ -740,6 +861,7 @@ if st.session_state.last_sources:
             st.write(snippet)
 
 st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 
